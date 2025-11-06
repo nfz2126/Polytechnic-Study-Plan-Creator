@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polytechnic Study Planner</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f9;
+        }
+        /* Custom scrollbar for better aesthetics */
+        .scroll-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .scroll-container::-webkit-scrollbar-thumb {
+            background: #a5b4fc;
+            border-radius: 10px;
+        }
+        .scroll-container::-webkit-scrollbar-track {
+            background: #e0e7ff;
+        }
+        /* Ensure message box is visible initially, then hidden by JS */
+        #message-box {
+            opacity: 0;
+            transition: opacity 300ms ease-in-out;
+        }
+    </style>
+</head>
+<body class="min-h-screen antialiased flex flex-col items-center p-4">
+
+    <!-- Firebase Imports and Setup -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+        // --- Global Variables (Provided by Canvas Environment) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-study-plan-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let subjects = [];
+        let departmentName = '';
+        let semesterGPA = ''; 
+        let gpaTarget = ''; // NEW: Target GPA
+        let studyBlockDuration = 60; // NEW: Preferred study block length in minutes (Default 60)
+
+        // --- Utility Functions ---
+        function dateDiffInDays(a, b) {
+            const _MS_PER_DAY = 1000 * 60 * 60 * 24;
+            const utc1 = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+            const utc2 = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+            return Math.floor((utc2 - utc1) / _MS_PER_DAY);
+        }
+
+        function showMessage(msg, type = 'info') {
+            const box = document.getElementById('message-box');
+            box.textContent = msg;
+            box.style.opacity = '1';
+            box.className = `p-3 rounded-xl mb-4 text-center text-sm font-medium transition-opacity duration-300 ${
+                type === 'error' ? 'bg-red-100 text-red-700' : 
+                type === 'success' ? 'bg-green-100 text-green-700' : 
+                'bg-blue-100 text-blue-700'
+            }`;
+            setTimeout(() => {
+                box.style.opacity = '0';
+            }, 4000);
+        }
+
+        // --- Firebase Core Setup ---
+        async function initializeFirebaseAndAuth() {
+            if (!firebaseConfig) {
+                console.error("Firebase configuration is missing.");
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Authenticate
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        loadPlan();
+                    } else {
+                        userId = null;
+                        console.error("Authentication failed.");
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+            }
+        }
+
+        function getStudyPlanRef() {
+            if (!db || !userId) return null;
+            // Private data path: /artifacts/{appId}/users/{userId}/studyPlans/currentPlan
+            return doc(db, 'artifacts', appId, 'users', userId, 'studyPlans', 'currentPlan');
+        }
+
+        // --- Data Loading and Saving ---
+        function updateStudentInfoDisplay() {
+            document.getElementById('departmentNameInput').value = departmentName || '';
+            document.getElementById('semesterGPAInput').value = semesterGPA || '';
+            document.getElementById('gpaTargetInput').value = gpaTarget || '';
+            document.getElementById('studyBlockDurationInput').value = studyBlockDuration || 60;
+        }
+
+        async function saveAllData() {
+            const planRef = getStudyPlanRef();
+            if (!planRef) {
+                console.error("Cannot save plan: Database not ready or user not logged in.");
+                showMessage("Database not ready. Cannot save data.", 'error');
+                return;
+            }
+            try {
+                await setDoc(planRef, { 
+                    subjects: subjects,
+                    departmentName: departmentName,
+                    semesterGPA: semesterGPA,
+                    gpaTarget: gpaTarget, // Save new field
+                    studyBlockDuration: studyBlockDuration // Save new field
+                }, { merge: true });
+                console.log("Study plan and student info updated successfully.");
+            } catch (e) {
+                console.error("Error saving document: ", e);
+                showMessage("Error saving plan: " + e.message, 'error');
+            }
+        }
+
+        function loadPlan() {
+            const planRef = getStudyPlanRef();
+            if (!planRef) return;
+
+            onSnapshot(planRef, (doc) => {
+                if (doc.exists()) {
+                    const data = doc.data();
+                    subjects = data.subjects || [];
+                    departmentName = data.departmentName || '';
+                    semesterGPA = data.semesterGPA || '';
+                    gpaTarget = data.gpaTarget || ''; // Load new field
+                    studyBlockDuration = data.studyBlockDuration || 60; // Load new field
+                    
+                    renderPlan(subjects);
+                    updateStudentInfoDisplay();
+                } else {
+                    subjects = [];
+                    departmentName = '';
+                    semesterGPA = '';
+                    gpaTarget = '';
+                    studyBlockDuration = 60;
+                    renderPlan(subjects);
+                    updateStudentInfoDisplay();
+                    setDoc(planRef, { subjects: [], studyBlockDuration: 60 }, { merge: true }).catch(console.error);
+                }
+            }, (error) => {
+                console.error("Error fetching study plan:", error);
+            });
+        }
+
+        // --- Study Plan Logic ---
+        function calculatePlan(subjectList) {
+            const today = new Date();
+            let totalPlannedHours = 0;
+            let totalStudiedHours = 0;
+            let totalDailyTargetHours = 0;
+            let urgentSubjectsCount = 0;
+            
+            const calculatedPlan = subjectList.map(sub => {
+                const examDate = new Date(sub.examDate);
+                const daysRemaining = dateDiffInDays(today, examDate);
+                const totalHours = parseFloat(sub.totalHours);
+                const hoursStudied = parseFloat(sub.hoursStudied || 0);
+                const hoursRemaining = Math.max(0, totalHours - hoursStudied);
+
+                totalPlannedHours += totalHours;
+                totalStudiedHours += hoursStudied;
+
+                let dailyTarget = 0;
+                let weeklyTarget = 0;
+                let status = "On track";
+                let progressPercentage = (totalHours > 0) ? Math.min(100, (hoursStudied / totalHours) * 100) : 100;
+
+                if (daysRemaining > 0 && hoursRemaining > 0) {
+                    dailyTarget = hoursRemaining / daysRemaining;
+                    weeklyTarget = dailyTarget * 7;
+                } else if (daysRemaining === 0 && hoursRemaining > 0) {
+                    dailyTarget = hoursRemaining;
+                    status = "EXAM TODAY! All hours remaining.";
+                } else if (daysRemaining < 0) {
+                    status = "EXAM PASSED";
+                } else if (hoursRemaining === 0 && totalHours > 0) {
+                    status = "Goal Completed!";
+                } else if (totalHours === 0) {
+                    status = "Finished (0 hours required)";
+                }
+                
+                const isUrgent = dailyTarget > 2 && daysRemaining < 14 && daysRemaining >= 0 && hoursRemaining > 0;
+                if (isUrgent) {
+                    urgentSubjectsCount++;
+                }
+
+                if (hoursRemaining > 0 && daysRemaining >= 0) {
+                    totalDailyTargetHours += dailyTarget;
+                }
+
+                return {
+                    ...sub,
+                    hoursStudied,
+                    hoursRemaining,
+                    daysRemaining,
+                    progressPercentage: progressPercentage.toFixed(0),
+                    dailyTarget: dailyTarget.toFixed(2),
+                    weeklyTarget: weeklyTarget.toFixed(2),
+                    status,
+                    isUrgent
+                };
+            }).sort((a, b) => {
+                // Sort by urgency/days remaining and remaining hours
+                if (a.daysRemaining < 0) return 1; 
+                if (b.daysRemaining < 0) return -1;
+                
+                if (a.daysRemaining === b.daysRemaining) {
+                    return b.hoursRemaining - a.hoursRemaining;
+                }
+
+                return a.daysRemaining - b.daysRemaining;
+            });
+
+            // Summary data calculation
+            const overallCompletion = (totalPlannedHours > 0) ? 
+                (totalStudiedHours / totalPlannedHours * 100).toFixed(1) : (totalPlannedHours === 0 && subjectList.length > 0) ? '100.0' : '0.0';
+            
+            // Logic for the unique style info/motivational message
+            let motivationalMessage = "Time to plan! Add your subjects and goals to get started.";
+            if (totalPlannedHours > 0 || subjectList.length > 0) {
+                if (parseFloat(overallCompletion) >= 100) {
+                    motivationalMessage = "🎊 All study goals completed! Excellent work, rest easy!";
+                } else if (urgentSubjectsCount > 0) {
+                    motivationalMessage = `🚨 Focus! You have ${urgentSubjectsCount} urgent subject(s) requiring immediate attention.`;
+                } else if (parseFloat(overallCompletion) > 50) {
+                    motivationalMessage = "You've passed the halfway mark! Great momentum, keep pushing!";
+                } else if (parseFloat(overallCompletion) > 0) {
+                    motivationalMessage = "Every hour counts. Keep building your momentum!";
+                }
+            }
+
+            return {
+                plan: calculatedPlan,
+                summary: {
+                    totalPlannedHours: totalPlannedHours.toFixed(1),
+                    totalStudiedHours: totalStudiedHours.toFixed(1),
+                    overallCompletion,
+                    urgentSubjectsCount,
+                    motivationalMessage,
+                    totalDailyTargetHours: totalDailyTargetHours.toFixed(2)
+                }
+            };
+        }
+
+        // --- Event Handlers ---
+        
+        window.addSubject = function() {
+            const nameInput = document.getElementById('subjectName');
+            const hoursInput = document.getElementById('totalHours');
+            const dateInput = document.getElementById('examDate');
+            const syllabusInput = document.getElementById('syllabusLink');
+
+            const newSubject = {
+                id: crypto.randomUUID(),
+                name: nameInput.value.trim(),
+                totalHours: parseFloat(hoursInput.value),
+                examDate: dateInput.value,
+                syllabusLink: syllabusInput.value.trim(),
+                hoursStudied: 0
+            };
+
+            if (!newSubject.name || isNaN(newSubject.totalHours) || newSubject.totalHours <= 0 || !newSubject.examDate) {
+                showMessage("Please fill in Subject Name, Total Hours (>0), and Exam Date.", 'error');
+                return;
+            }
+
+            subjects.push(newSubject);
+            saveAllData();
+
+            // Clear form
+            nameInput.value = '';
+            hoursInput.value = '';
+            syllabusInput.value = '';
+            showMessage("Subject added successfully! Check your schedule below.", 'success');
+        }
+
+        window.removeSubject = function(id) {
+            subjects = subjects.filter(sub => sub.id !== id);
+            saveAllData();
+            showMessage("Subject removed.", 'info');
+        }
+        
+        window.updateStudentInfo = function(field) {
+            let gpaInput, durationInput, gpa;
+
+            switch (field) {
+                case 'department':
+                    departmentName = document.getElementById('departmentNameInput').value.trim();
+                    break;
+                case 'currentGpa':
+                    gpaInput = document.getElementById('semesterGPAInput');
+                    gpa = parseFloat(gpaInput.value);
+                    if (gpaInput.value.trim() === '') { semesterGPA = ''; } 
+                    else if (isNaN(gpa) || gpa < 0 || gpa > 4.0) { showMessage("Current GPA must be between 0.00 and 4.00.", 'error'); gpaInput.value = semesterGPA; return;} 
+                    else { semesterGPA = gpa.toFixed(2); }
+                    break;
+                case 'targetGpa':
+                    gpaInput = document.getElementById('gpaTargetInput');
+                    gpa = parseFloat(gpaInput.value);
+                    if (gpaInput.value.trim() === '') { gpaTarget = ''; } 
+                    else if (isNaN(gpa) || gpa < 0 || gpa > 4.0) { showMessage("Target GPA must be between 0.00 and 4.00.", 'error'); gpaInput.value = gpaTarget; return;} 
+                    else { gpaTarget = gpa.toFixed(2); }
+                    break;
+                case 'studyBlock':
+                    durationInput = document.getElementById('studyBlockDurationInput');
+                    const duration = parseInt(durationInput.value);
+                    if (isNaN(duration) || duration < 10 || duration > 180) {
+                        showMessage("Study block must be between 10 and 180 minutes.", 'error');
+                        durationInput.value = studyBlockDuration;
+                        return;
+                    }
+                    studyBlockDuration = duration;
+                    break;
+            }
+
+            saveAllData();
+            showMessage("Student information updated.", 'info');
+        }
+
+        window.logHours = function(id) {
+            const hoursInput = document.getElementById(`logHours_${id}`);
+            const hours = parseFloat(hoursInput.value);
+            
+            if (isNaN(hours) || hours <= 0) {
+                showMessage("Please enter a valid number of hours to log.", 'error');
+                return;
+            }
+
+            const subjectIndex = subjects.findIndex(sub => sub.id === id);
+            if (subjectIndex !== -1) {
+                const currentStudied = subjects[subjectIndex].hoursStudied || 0;
+                const newStudied = currentStudied + hours;
+                
+                if (newStudied > subjects[subjectIndex].totalHours) {
+                    showMessage(`You can only log ${subjects[subjectIndex].totalHours - currentStudied} more hours to reach the goal.`, 'error');
+                    hoursInput.value = '';
+                    return;
+                }
+
+                subjects[subjectIndex].hoursStudied = newStudied;
+                saveAllData();
+                showMessage(`${hours} hours logged for ${subjects[subjectIndex].name}! Keep going!`, 'success');
+                hoursInput.value = '';
+            }
+        }
+
+        // --- Summary Rendering (Updated with Session Recommendation) ---
+        function renderSummary(summaryData) {
+            const container = document.getElementById('summary-dashboard');
+            const { 
+                totalPlannedHours, 
+                totalStudiedHours, 
+                overallCompletion, 
+                motivationalMessage,
+                totalDailyTargetHours
+            } = summaryData;
+
+            // Calculate Session Recommendation
+            let sessionRecommendation = "Ready for the next session!";
+            const blockInHours = studyBlockDuration / 60;
+            
+            if (totalDailyTargetHours > 0 && blockInHours > 0) {
+                const sessionsNeeded = totalDailyTargetHours / blockInHours;
+                sessionRecommendation = `Your study structure today is approximately ${Math.ceil(sessionsNeeded)} block(s) of ${studyBlockDuration} minutes.`;
+            } else if (parseFloat(overallCompletion) >= 100) {
+                sessionRecommendation = "All goals met. Consider an early break!";
+            }
+            
+            // Determine GPA status message
+            let gpaStatusMessage = "";
+            let gpaTargetDisplay = gpaTarget || 'N/A';
+            let gpaColor = 'text-gray-500';
+
+            if (gpaTarget) {
+                gpaStatusMessage = `Target GPA: ${gpaTarget}`;
+                gpaTargetDisplay = gpaTarget;
+                gpaColor = 'text-pink-600';
+            } else if (semesterGPA) {
+                gpaStatusMessage = `Last GPA: ${semesterGPA}`;
+                gpaTargetDisplay = semesterGPA;
+                gpaColor = 'text-blue-600';
+            }
+
+
+            container.innerHTML = `
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                    <!-- Total Planned Hours -->
+                    <div class="bg-indigo-100 p-4 rounded-xl shadow-inner text-center">
+                        <p class="text-sm font-medium text-indigo-600">Total Planned Hours</p>
+                        <p class="text-2xl font-bold text-indigo-800">${totalPlannedHours} hrs</p>
+                    </div>
+                    <!-- Total Studied Hours -->
+                    <div class="bg-green-100 p-4 rounded-xl shadow-inner text-center">
+                        <p class="text-sm font-medium text-green-600">Total Hours Logged</p>
+                        <p class="text-2xl font-bold text-green-800">${totalStudiedHours} hrs</p>
+                    </div>
+                    <!-- Target GPA / Last GPA -->
+                    <div class="bg-pink-100 p-4 rounded-xl shadow-inner text-center">
+                        <p class="text-sm font-medium ${gpaColor}">${gpaStatusMessage.split(':')[0]}</p>
+                        <p class="text-2xl font-bold ${gpaColor}">${gpaTargetDisplay}</p>
+                    </div>
+                    <!-- Completion Percentage -->
+                    <div class="bg-yellow-100 p-4 rounded-xl shadow-inner text-center">
+                        <p class="text-sm font-medium text-yellow-700">Overall Progress</p>
+                        <p class="text-2xl font-bold text-yellow-800">${overallCompletion}%</p>
+                    </div>
+                </div>
+                
+                <!-- Unique Style Info/Motivational Message -->
+                <div class="bg-purple-600 text-white p-4 rounded-xl shadow-lg text-center border-b-4 border-purple-800 transition duration-500 hover:scale-[1.01] mb-6">
+                    <p class="text-lg font-bold">Progress Insight:</p>
+                    <p class="text-xl font-extrabold mt-1 mb-2">${motivationalMessage}</p>
+                    <div class="w-full bg-purple-700 rounded-full h-2.5">
+                        <div class="h-2.5 rounded-full bg-yellow-300 transition-all duration-500" style="width: ${overallCompletion}%"></div>
+                    </div>
+                    <p class="text-sm italic mt-3">${sessionRecommendation}</p>
+                </div>
+            `;
+        }
+
+
+        // --- UI Rendering ---
+        function renderPlan(subjectList) {
+            const planContainer = document.getElementById('study-plan-details'); 
+            
+            if (subjectList.length === 0) {
+                document.getElementById('summary-dashboard').innerHTML = '';
+                planContainer.innerHTML = `<p class="text-center text-gray-500 p-8">No subjects added yet. Add a subject and set your goals above to create your plan!</p>`;
+                return;
+            }
+
+            const { plan, summary } = calculatePlan(subjectList);
+            
+            renderSummary(summary); 
+            
+            planContainer.innerHTML = ''; 
+
+            plan.forEach(sub => {
+                const isCompleted = sub.hoursRemaining === 0 && sub.totalHours > 0;
+                const badgeColor = sub.daysRemaining < 0 ? 'bg-gray-300' : 
+                                   isCompleted ? 'bg-green-600' :
+                                   sub.isUrgent ? 'bg-red-500' : 'bg-indigo-500';
+
+                const urgencyText = sub.daysRemaining < 0 ? 'Exam Done' : 
+                                    isCompleted ? 'Completed' :
+                                    sub.daysRemaining === 0 ? 'TODAY' : 
+                                    sub.daysRemaining > 0 ? `${sub.daysRemaining} Day${sub.daysRemaining !== 1 ? 's' : ''}` : '';
+
+
+                const dailyInfo = sub.hoursRemaining > 0 && sub.daysRemaining >= 0
+                    ? `<span class="text-lg font-bold text-indigo-700">${sub.dailyTarget} hrs</span> / day` 
+                    : `<span class="text-sm text-gray-600">${sub.status}</span>`;
+
+                const weeklyInfo = sub.hoursRemaining > 0 && sub.daysRemaining >= 0
+                    ? `<span class="text-lg font-bold text-green-700">${sub.weeklyTarget} hrs</span> / week`
+                    : '';
+                
+                const syllabusContent = sub.syllabusLink
+                    ? `<a href="${sub.syllabusLink.startsWith('http') ? sub.syllabusLink : 'https://' + sub.syllabusLink}" target="_blank" class="text-indigo-600 hover:text-indigo-800 font-medium text-sm truncate block underline" title="${sub.syllabusLink}">View Syllabus/Chapters</a>`
+                    : `<span class="text-sm text-gray-500">No link provided</span>`;
+
+
+                const card = document.createElement('div');
+                card.className = `bg-white shadow-xl rounded-2xl p-6 mb-6 border-l-8 ${sub.isUrgent ? 'border-red-500' : isCompleted ? 'border-green-500' : sub.daysRemaining < 0 ? 'border-gray-400' : 'border-indigo-500'} transition duration-300 hover:shadow-2xl`;
+                
+                card.innerHTML = `
+                    <div class="flex justify-between items-start mb-4">
+                        <h3 class="text-2xl font-extrabold text-gray-800">${sub.name}</h3>
+                        <button onclick="removeSubject('${sub.id}')" class="text-gray-400 hover:text-red-500 transition duration-150 p-1">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                        </button>
+                    </div>
+
+                    <!-- Progress Bar and Percentages -->
+                    <div class="mb-5">
+                        <div class="flex justify-between text-sm font-medium text-gray-600 mb-1">
+                            <span>Progress: ${sub.hoursStudied.toFixed(2)} / ${sub.totalHours.toFixed(2)} hrs</span>
+                            <span class="${isCompleted ? 'text-green-600' : 'text-indigo-600'}">${sub.progressPercentage}% Complete</span>
+                        </div>
+                        <div class="w-full bg-gray-200 rounded-full h-2.5">
+                            <div class="h-2.5 rounded-full ${isCompleted ? 'bg-green-500' : 'bg-indigo-500'}" style="width: ${sub.progressPercentage}%"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4 border-t border-gray-100 pt-4">
+                        <!-- Exam Date and Hours Remaining -->
+                        <div>
+                            <p class="text-sm font-medium text-gray-500">Exam Date</p>
+                            <p class="text-xl font-semibold text-gray-700">${sub.examDate}</p>
+                        </div>
+                        <div>
+                            <p class="text-sm font-medium text-gray-500">Hours Remaining</p>
+                            <p class="text-xl font-semibold ${sub.hoursRemaining > 0 ? 'text-red-600' : 'text-green-600'}">
+                                ${sub.hoursRemaining.toFixed(2)} hrs
+                            </p>
+                        </div>
+                         <!-- Syllabus Link -->
+                        <div class="col-span-2 mt-2">
+                            <p class="text-sm font-medium text-gray-500">Syllabus Reference</p>
+                            ${syllabusContent}
+                        </div>
+                    </div>
+
+                    <!-- Targets -->
+                    <div class="mt-4 p-4 rounded-xl bg-indigo-50/50 border border-dashed border-indigo-200">
+                        <div class="flex justify-between items-center mb-2">
+                            <p class="text-sm font-semibold text-indigo-600 uppercase">Target Time (Based on Remaining Hours)</p>
+                            <span class="px-3 py-1 text-xs font-bold rounded-full text-white ${badgeColor}">
+                                ${urgencyText}
+                            </span>
+                        </div>
+                        <div class="flex justify-around text-center">
+                            <div class="flex-1 border-r border-indigo-100 pr-3">
+                                <p class="text-lg font-medium text-gray-600">Daily</p>
+                                ${dailyInfo}
+                            </div>
+                            <div class="flex-1 pl-3">
+                                <p class="text-lg font-medium text-gray-600">Weekly</p>
+                                ${weeklyInfo}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Progress Logging Input -->
+                    ${!isCompleted && sub.daysRemaining >= 0 ? `
+                        <div class="mt-5 pt-4 border-t border-gray-100 flex gap-3 items-center">
+                            <input type="number" id="logHours_${sub.id}" placeholder="Hours Studied Today" min="0.1" step="0.1"
+                                class="flex-grow p-2 border border-green-300 rounded-lg focus:ring-1 focus:ring-green-500 focus:border-green-500 transition duration-150">
+                            <button onclick="logHours('${sub.id}')"
+                                class="bg-green-600 text-white font-semibold py-2 px-4 rounded-lg hover:bg-green-700 transition duration-200 shadow-md active:scale-95 whitespace-nowrap">
+                                Log Hours
+                            </button>
+                        </div>
+                    ` : ''}
+                `;
+                planContainer.appendChild(card);
+            });
+        }
+
+        // Initialize on page load
+        window.onload = initializeFirebaseAndAuth;
+    </script>
+
+
+    <!-- Main Layout Container -->
+    <div class="w-full max-w-4xl bg-white shadow-2xl rounded-3xl p-6 md:p-10 mb-8">
+        <header class="text-center mb-6">
+            <h1 class="text-4xl font-extrabold text-indigo-600">Polytechnic Study Plan Creator</h1>
+            <p class="mt-2 text-gray-600">Track your progress and crush those exams!</p>
+        </header>
+
+        <!-- Message Box for Feedback (Replaces alert()) -->
+        <div id="message-box" class="opacity-0 transition-opacity duration-300"></div>
+
+
+        <!-- Student Info Section (Department & Result) -->
+        <div class="bg-blue-50 p-5 rounded-xl shadow-md mb-8">
+            <h2 class="text-xl font-bold text-blue-700 mb-3 flex items-center">
+                <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M12 20.207l-2.071-2.071M12 20.207l-2.071-2.071M12 20.207l2.071-2.071m-2.071-2.071l2.071-2.071"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 14v6m-4-2h8"></path></svg>
+                My Polytechnic Info & Goals
+            </h2>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <!-- Department Name -->
+                <div class="md:col-span-2">
+                    <label for="departmentNameInput" class="text-sm font-medium text-gray-600">Department/Major</label>
+                    <input type="text" id="departmentNameInput" placeholder="e.g., Civil Engineering" 
+                           onchange="updateStudentInfo('department')"
+                           class="w-full p-2 border border-blue-300 rounded-lg focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition duration-150 mt-1">
+                </div>
+                <!-- Last GPA -->
+                <div>
+                    <label for="semesterGPAInput" class="text-sm font-medium text-gray-600">Last Semester GPA</label>
+                    <input type="number" step="0.01" min="0" max="4.0" id="semesterGPAInput" placeholder="e.g., 3.85" 
+                           onchange="updateStudentInfo('currentGpa')"
+                           class="w-full p-2 border border-blue-300 rounded-lg focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition duration-150 mt-1">
+                </div>
+                <!-- GPA Target (NEW) -->
+                <div>
+                    <label for="gpaTargetInput" class="text-sm font-medium text-gray-600">Target GPA</label>
+                    <input type="number" step="0.01" min="0" max="4.0" id="gpaTargetInput" placeholder="e.g., 4.00" 
+                           onchange="updateStudentInfo('targetGpa')"
+                           class="w-full p-2 border border-pink-300 rounded-lg focus:ring-1 focus:ring-pink-500 focus:border-pink-500 transition duration-150 mt-1">
+                </div>
+                <!-- Study Block Duration (NEW) -->
+                <div class="md:col-span-2">
+                    <label for="studyBlockDurationInput" class="text-sm font-medium text-gray-600">Preferred Study Block (Mins)</label>
+                    <input type="number" min="10" max="180" id="studyBlockDurationInput" placeholder="e.g., 60" 
+                           onchange="updateStudentInfo('studyBlock')"
+                           class="w-full p-2 border border-purple-300 rounded-lg focus:ring-1 focus:ring-purple-500 focus:border-purple-500 transition duration-150 mt-1">
+                </div>
+            </div>
+        </div>
+
+        <!-- Subject Input Form -->
+        <div class="bg-indigo-50 p-6 rounded-xl shadow-inner mb-8">
+            <h2 class="text-2xl font-bold text-indigo-700 mb-4">Add Exam Subject</h2>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <!-- Subject Name -->
+                <input type="text" id="subjectName" placeholder="Subject Name (e.g., Thermodynamics)" required
+                       class="md:col-span-2 p-3 border border-indigo-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                
+                <!-- Total Hours -->
+                <input type="number" id="totalHours" placeholder="Total Hours to Study" required min="1"
+                       class="p-3 border border-indigo-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                
+                <!-- Exam Date -->
+                <input type="date" id="examDate" required
+                       class="p-3 border border-indigo-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                
+                <!-- Syllabus Link -->
+                <input type="text" id="syllabusLink" placeholder="Syllabus/Chapter Link (optional URL)"
+                       class="md:col-span-4 p-3 border border-indigo-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+            </div>
+            <button onclick="addSubject()"
+                    class="mt-4 w-full bg-indigo-600 text-white font-semibold py-3 rounded-lg hover:bg-indigo-700 transition duration-200 shadow-md hover:shadow-lg transform hover:scale-[1.01] active:scale-[0.99]">
+                Add Subject & Calculate Plan
+            </button>
+        </div>
+
+        <!-- Study Plan Output -->
+        <h2 class="text-3xl font-extrabold text-gray-800 mb-6 border-b-2 border-indigo-100 pb-2">Your Detailed Study Schedule</h2>
+        
+        <!-- Summary Dashboard Container -->
+        <div id="summary-dashboard" class="mb-8">
+            <!-- Summary stats, GPA info, and motivational message are rendered here -->
+        </div>
+
+        <div id="study-plan-details" class="scroll-container max-h-[60vh] overflow-y-auto">
+            <!-- Individual subject cards will be rendered here by JavaScript -->
+            <p class="text-center text-gray-500 p-8">Loading your plan...</p>
+        </div>
+    </div>
+
+</body>
+</html>
